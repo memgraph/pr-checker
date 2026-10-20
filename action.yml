@@ -1,0 +1,65 @@
+name: PR checker
+description: Check that a pull request has the required labels, a milestone, and a release note.
+
+inputs:
+  github-token:
+    description: Token used to read PR comments and post the advisory comment. Usually `secrets.GITHUB_TOKEN`.
+    required: true
+  check-labels:
+    description: Run the label and milestone check.
+    default: 'true'
+  check-release-note:
+    description: Run the release-note check.
+    default: 'true'
+  docs-labels:
+    description: Comma-separated docs labels. The PR must have exactly one. Empty disables this check.
+    default: 'docs-changelog-only,docs-needed,docs-not-needed'
+  component-labels:
+    description: Comma-separated component labels. The PR must have at least one. Empty disables this check.
+    default: ''
+  type-labels:
+    description: Comma-separated type labels. The PR must have at least one. Empty disables this check.
+    default: 'bug,feature,infrastructure'
+  require-milestone:
+    description: Require the PR to be assigned to a milestone.
+    default: 'true'
+  skip-release-note-label:
+    description: PRs with this label skip the release-note check.
+    default: 'docs-not-needed'
+  openai-api-key:
+    description: OpenAI API key for the release-note quality check. If empty, the quality check is skipped.
+    default: ''
+  openai-model:
+    description: OpenAI model used for the release-note quality check.
+    default: 'gpt-5-mini'
+  python-version:
+    description: Python version to set up (3.10 or newer).
+    default: '3.12'
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Check PR labels
+      if: inputs.check-labels == 'true'
+      shell: bash
+      env:
+        DOCS_LABELS: ${{ inputs.docs-labels }}
+        COMPONENT_LABELS: ${{ inputs.component-labels }}
+        TYPE_LABELS: ${{ inputs.type-labels }}
+        REQUIRE_MILESTONE: ${{ inputs.require-milestone }}
+      run: python "$GITHUB_ACTION_PATH/scripts/check_labels.py"
+
+    - name: Check PR release note
+      if: inputs.check-release-note == 'true'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        OPENAI_MODEL: ${{ inputs.openai-model }}
+        SKIP_RELEASE_NOTE_LABEL: ${{ inputs.skip-release-note-label }}
+      run: python "$GITHUB_ACTION_PATH/scripts/check_changelog.py"
