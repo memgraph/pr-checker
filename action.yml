@@ -34,7 +34,7 @@ inputs:
     default: 'gpt-5-mini'
   python-version:
     description: Python version to set up (3.10 or newer).
-    default: '3.11'
+    default: '3.12'
 
 runs:
   using: composite
