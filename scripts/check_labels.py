@@ -6,6 +6,10 @@ Configured through environment variables (set by action.yml):
   COMPONENT_LABELS:  comma-separated; at least one must be present (empty disables)
   TYPE_LABELS:       comma-separated; at least one must be present (empty disables)
   REQUIRE_MILESTONE: "true" / "false"
+  GITHUB_TOKEN:      used to fetch the PR's current labels and milestone
+
+Labels and milestone are fetched live, so a re-run sees the PR as it is now
+rather than as it was when the event fired.
 
 Outside a pull_request event, PR_LABELS and PR_MILESTONE can be set for local testing.
 """
@@ -59,7 +63,7 @@ def check_inclusive(labels: list[str], group: list[str], description: str) -> st
 
 
 def main() -> int:
-    pr = load_pull_request()
+    pr = load_pull_request(os.environ.get("GITHUB_TOKEN"))
     labels = load_labels(pr)
     require_milestone = parse_bool(os.environ.get("REQUIRE_MILESTONE"), default=True)
 
