@@ -3,7 +3,7 @@ description: Check that a pull request has the required labels, a milestone, and
 
 inputs:
   github-token:
-    description: Token used to read PR comments and post the advisory comment. Usually `secrets.GITHUB_TOKEN`.
+    description: Token used to read the PR and its comments, and post the advisory comment. Usually `github.token`.
     required: true
   check-labels:
     description: Run the label and milestone check.
@@ -39,15 +39,22 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Skip in the merge queue
+      if: github.event_name == 'merge_group'
+      shell: bash
+      run: echo "Labels and the release note are checked on the pull request; nothing to check in the merge queue."
+
     - name: Set up Python
+      if: github.event_name != 'merge_group'
       uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: ${{ inputs.python-version }}
 
     - name: Check PR labels
-      if: inputs.check-labels == 'true'
+      if: inputs.check-labels == 'true' && github.event_name != 'merge_group'
       shell: bash
       env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
         DOCS_LABELS: ${{ inputs.docs-labels }}
         COMPONENT_LABELS: ${{ inputs.component-labels }}
         TYPE_LABELS: ${{ inputs.type-labels }}
@@ -55,7 +62,7 @@ runs:
       run: python "$GITHUB_ACTION_PATH/scripts/check_labels.py"
 
     - name: Check PR release note
-      if: inputs.check-release-note == 'true'
+      if: inputs.check-release-note == 'true' && github.event_name != 'merge_group'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
