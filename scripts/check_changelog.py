@@ -5,10 +5,11 @@ Skipped when the PR has the label named by SKIP_RELEASE_NOTE_LABEL. Otherwise,
 searches PR issue comments for the template (anchored on the
 `### Documentation checklist` heading) and requires at least one sub-bullet
 under `Write a release note` that is non-empty and not the unfilled placeholder.
+Only comments by the PR author, or by a repo owner, member or collaborator, count.
 
 If `OPENAI_API_KEY` is set, the extracted note is then sent to an LLM for
 a quality / format check. The model returns one of:
-  - "pass":   silent, exit 0
+  - "pass":   resolve any earlier advisory comment, exit 0
   - "advise": upsert an advisory PR comment, exit 0
   - "block":  upsert an advisory PR comment, exit 1
 If the API key is missing or the call fails, the LLM step is skipped.
@@ -16,15 +17,16 @@ If the API key is missing or the call fails, the LLM step is skipped.
 
 import json
 import os
+import re
 import sys
-import urllib.error
 import urllib.request
 
-from _common import find_release_note, github_request, load_pull_request, paginate
+from _common import API_ERRORS, find_release_note, github_request, load_pull_request, paginate
 
 DEFAULT_SKIP_LABEL = "docs-not-needed"
 ADVISORY_MARKER = "<!-- pr-checker:changelog-advisory -->"
 DEFAULT_MODEL = "gpt-5-mini"
+TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
 SYSTEM_PROMPT = """\
 You review release notes for the {repo} repository.
@@ -69,10 +71,36 @@ def fetch_comments(pr: dict, token: str) -> list[dict]:
     if not comments_url:
         return []
     return [
-        {"id": c["id"], "body": c.get("body") or ""}
+        {
+            "id": c["id"],
+            "body": c.get("body") or "",
+            "login": (c.get("user") or {}).get("login"),
+            "is_bot": (c.get("user") or {}).get("type") == "Bot",
+            "association": c.get("author_association"),
+        }
         for page in paginate(f"{comments_url}?per_page=100", token)
         for c in page
     ]
+
+
+def is_trusted(comment: dict, pr: dict) -> bool:
+    author = (pr.get("user") or {}).get("login")
+    return (author is not None and comment["login"] == author) or comment["association"] in TRUSTED_ASSOCIATIONS
+
+
+def find_note(comments: list[dict], pr: dict) -> str | None:
+    for comment in comments:
+        note = find_release_note(comment["body"])
+        if not note:
+            continue
+        if is_trusted(comment, pr):
+            return note
+        author = f"@{comment['login']}" if comment["login"] else "a deleted user"
+        print(
+            f"::notice::Ignoring the release note in a comment by {author}: "
+            "only the PR author or a repo owner, member or collaborator can supply it."
+        )
+    return None
 
 
 def evaluate_note(note: str, pr: dict) -> dict | None:
@@ -127,34 +155,63 @@ def evaluate_note(note: str, pr: dict) -> dict | None:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read())
         content = data["choices"][0]["message"]["content"]
-        verdict = json.loads(content)
-    except (urllib.error.URLError, TimeoutError, KeyError, IndexError, json.JSONDecodeError) as exc:
-        print(f"::warning::OpenAI quality check failed ({exc}); skipping.")
+        # A refusal has null content, and the model is not guaranteed to return an object.
+        verdict = json.loads(content) if isinstance(content, str) else None
+    except (*API_ERRORS, LookupError, TypeError) as exc:
+        print(f"::warning::OpenAI quality check failed ({exc!r}); skipping.")
         return None
 
-    if verdict.get("verdict") not in {"pass", "advise", "block"}:
-        print(f"::warning::Unexpected verdict from model: {verdict!r}; skipping.")
+    if not isinstance(verdict, dict) or verdict.get("verdict") not in {"pass", "advise", "block"}:
+        print(f"::warning::Unexpected response from model: {verdict!r}; skipping.")
         return None
     return verdict
 
 
-def upsert_advisory_comment(pr: dict, token: str, body_text: str) -> None:
+def find_advisory(comments: list[dict]) -> dict | None:
+    # Only a bot can have posted ours; a person could paste the marker to have their comment overwritten.
+    return next((c for c in comments if c["is_bot"] and c["body"].lstrip().startswith(ADVISORY_MARKER)), None)
+
+
+def write_advisory(pr: dict, token: str, advisory: dict | None, body_text: str) -> None:
+    """Create the advisory comment, or update it in place if it exists."""
     full_body = f"{ADVISORY_MARKER}\n{body_text}"
+    if advisory and advisory["body"] == full_body:
+        return
     try:
-        existing = next(
-            (c for c in fetch_comments(pr, token) if c["body"].startswith(ADVISORY_MARKER)),
-            None,
-        )
-        if existing:
-            repo_url = pr["base"]["repo"]["url"]
-            url = f"{repo_url}/issues/comments/{existing['id']}"
+        if advisory:
+            url = f"{pr['base']['repo']['url']}/issues/comments/{advisory['id']}"
             with github_request(url, token, method="PATCH", body={"body": full_body}):
                 pass
         else:
             with github_request(pr["comments_url"], token, method="POST", body={"body": full_body}):
                 pass
-    except urllib.error.HTTPError as exc:
-        print(f"::warning::Could not upsert advisory comment ({exc}); continuing.")
+    except API_ERRORS as exc:
+        print(f"::warning::Could not write the advisory comment ({exc!r}); continuing.")
+
+
+def resolve_advisory(pr: dict, token: str, advisory: dict | None, body_text: str) -> None:
+    """Mark an earlier advisory as resolved, so a stale "blocked" comment doesn't linger."""
+    if advisory:
+        write_advisory(pr, token, advisory, f"**Release note advisory resolved**\n\n{body_text}")
+
+
+def code_span(text: str) -> str:
+    # Inside a code span, @mentions don't notify and markdown doesn't render.
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def defuse_mentions(text: str) -> str:
+    # A zero-width space after "@" stops GitHub treating it as a mention.
+    return re.sub(r"@(?=[A-Za-z0-9])", "@​", text)
+
+
+def one_line(text: str) -> str:
+    # Workflow commands are parsed at the start of a log line, so text from the model
+    # must not be able to start a new one.
+    return " ".join(str(text).split())
 
 
 def format_advisory(verdict: dict, note: str) -> str:
@@ -163,15 +220,17 @@ def format_advisory(verdict: dict, note: str) -> str:
         "advise": "**Release note advisory**",
         "block":  "**Release note blocked**",
     }[level]
-    return (
-        f"{header}\n\n"
-        f"> {note}\n\n"
-        f"{verdict.get('reason') or '(no reason provided)'}"
-    )
+    reason = defuse_mentions(str(verdict.get("reason") or "")) or "(no reason provided)"
+    return f"{header}\n\nRelease note: {code_span(note)}\n\n{reason}"
 
 
 def main() -> int:
-    pr = load_pull_request()
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        print("::error::GITHUB_TOKEN is required to fetch the PR and its comments.")
+        return 1
+
+    pr = load_pull_request(token)
     if not pr:
         print("::error::Not running in a pull_request event; cannot load PR.")
         return 1
@@ -179,17 +238,22 @@ def main() -> int:
     label = skip_label()
     if has_skip_label(pr, label):
         print(f"Skipping release-note check: '{label}' label is set.")
+        try:
+            comments = fetch_comments(pr, token)
+        except API_ERRORS as exc:
+            print(f"::warning::Could not fetch PR comments to resolve an earlier advisory ({exc!r}).")
+            return 0
+        resolve_advisory(pr, token, find_advisory(comments), f"No release note is needed: the `{label}` label is set.")
         return 0
 
-    token = os.environ.get("GITHUB_TOKEN")
-    if not token:
-        print("::error::GITHUB_TOKEN is required to fetch PR comments.")
+    try:
+        comments = fetch_comments(pr, token)
+    except API_ERRORS as exc:
+        print(f"::error::Could not fetch PR comments ({exc!r}).")
         return 1
+    advisory = find_advisory(comments)
 
-    note = next(
-        (n for n in (find_release_note(c["body"]) for c in fetch_comments(pr, token)) if n),
-        None,
-    )
+    note = find_note(comments, pr)
     if not note:
         hint = f" (or add the '{label}' label if no note is required)" if label else ""
         print(
@@ -201,16 +265,20 @@ def main() -> int:
     print(f"Found release note: {note}")
 
     verdict = evaluate_note(note, pr)
-    if verdict is None or verdict["verdict"] == "pass":
+    if verdict is None:
+        resolve_advisory(pr, token, advisory, f"Release note: {code_span(note)}\n\nThe quality check was skipped.")
+        return 0
+    if verdict["verdict"] == "pass":
+        resolve_advisory(pr, token, advisory, f"Release note: {code_span(note)}")
         return 0
 
-    upsert_advisory_comment(pr, token, format_advisory(verdict, note))
+    write_advisory(pr, token, advisory, format_advisory(verdict, note))
 
     if verdict["verdict"] == "block":
-        print(f"::error::Release note blocked by quality check: {verdict.get('reason')}")
+        print(f"::error::Release note blocked by quality check: {one_line(verdict.get('reason') or '')}")
         return 1
 
-    print(f"::warning::Release note advisory: {verdict.get('reason')}")
+    print(f"::warning::Release note advisory: {one_line(verdict.get('reason') or '')}")
     return 0
 
 
