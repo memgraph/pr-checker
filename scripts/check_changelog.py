@@ -75,6 +75,7 @@ def fetch_comments(pr: dict, token: str) -> list[dict]:
             "id": c["id"],
             "body": c.get("body") or "",
             "login": (c.get("user") or {}).get("login"),
+            "is_bot": (c.get("user") or {}).get("type") == "Bot",
             "association": c.get("author_association"),
         }
         for page in paginate(f"{comments_url}?per_page=100", token)
@@ -94,8 +95,9 @@ def find_note(comments: list[dict], pr: dict) -> str | None:
             continue
         if is_trusted(comment, pr):
             return note
+        author = f"@{comment['login']}" if comment["login"] else "a deleted user"
         print(
-            f"::notice::Ignoring the release note in a comment by @{comment['login']}: "
+            f"::notice::Ignoring the release note in a comment by {author}: "
             "only the PR author or a repo owner, member or collaborator can supply it."
         )
     return None
@@ -166,7 +168,8 @@ def evaluate_note(note: str, pr: dict) -> dict | None:
 
 
 def find_advisory(comments: list[dict]) -> dict | None:
-    return next((c for c in comments if c["body"].startswith(ADVISORY_MARKER)), None)
+    # Only a bot can have posted ours; a person could paste the marker to have their comment overwritten.
+    return next((c for c in comments if c["is_bot"] and c["body"].lstrip().startswith(ADVISORY_MARKER)), None)
 
 
 def write_advisory(pr: dict, token: str, advisory: dict | None, body_text: str) -> None:
@@ -205,6 +208,12 @@ def defuse_mentions(text: str) -> str:
     return re.sub(r"@(?=[A-Za-z0-9])", "@​", text)
 
 
+def one_line(text: str) -> str:
+    # Workflow commands are parsed at the start of a log line, so text from the model
+    # must not be able to start a new one.
+    return " ".join(str(text).split())
+
+
 def format_advisory(verdict: dict, note: str) -> str:
     level = verdict["verdict"]
     header = {
@@ -226,18 +235,23 @@ def main() -> int:
         print("::error::Not running in a pull_request event; cannot load PR.")
         return 1
 
+    label = skip_label()
+    if has_skip_label(pr, label):
+        print(f"Skipping release-note check: '{label}' label is set.")
+        try:
+            comments = fetch_comments(pr, token)
+        except API_ERRORS as exc:
+            print(f"::warning::Could not fetch PR comments to resolve an earlier advisory ({exc!r}).")
+            return 0
+        resolve_advisory(pr, token, find_advisory(comments), f"No release note is needed: the `{label}` label is set.")
+        return 0
+
     try:
         comments = fetch_comments(pr, token)
     except API_ERRORS as exc:
         print(f"::error::Could not fetch PR comments ({exc!r}).")
         return 1
     advisory = find_advisory(comments)
-
-    label = skip_label()
-    if has_skip_label(pr, label):
-        print(f"Skipping release-note check: '{label}' label is set.")
-        resolve_advisory(pr, token, advisory, f"No release note is needed: the `{label}` label is set.")
-        return 0
 
     note = find_note(comments, pr)
     if not note:
@@ -252,6 +266,7 @@ def main() -> int:
 
     verdict = evaluate_note(note, pr)
     if verdict is None:
+        resolve_advisory(pr, token, advisory, f"Release note: {code_span(note)}\n\nThe quality check was skipped.")
         return 0
     if verdict["verdict"] == "pass":
         resolve_advisory(pr, token, advisory, f"Release note: {code_span(note)}")
@@ -260,10 +275,10 @@ def main() -> int:
     write_advisory(pr, token, advisory, format_advisory(verdict, note))
 
     if verdict["verdict"] == "block":
-        print(f"::error::Release note blocked by quality check: {verdict.get('reason')}")
+        print(f"::error::Release note blocked by quality check: {one_line(verdict.get('reason') or '')}")
         return 1
 
-    print(f"::warning::Release note advisory: {verdict.get('reason')}")
+    print(f"::warning::Release note advisory: {one_line(verdict.get('reason') or '')}")
     return 0
 
 

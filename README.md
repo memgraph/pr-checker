@@ -22,7 +22,9 @@ It runs two checks:
    If the key is missing or the API call fails, the quality check is skipped.
 
 The PR's labels, milestone and comments are fetched from the API when the check runs, so a
-re-run sees the PR as it is now, not as it was when the original event fired.
+re-run sees the PR as it is now, not as it was when the original event fired. If fetching the
+PR fails, the check logs a warning and uses the event payload instead, which can be stale on a
+re-run.
 
 ## Usage
 
@@ -77,7 +79,7 @@ the advisory comment can't be posted.
 
 | Input | Default | Description |
 | --- | --- | --- |
-| `github-token` | *(required)* | Token used to read the PR and its comments, and post the advisory comment. |
+| `github-token` | *(required)* | Token used to read the PR and its comments, and post the advisory comment. Use `github.token` or a GitHub App token: an advisory comment is only recognised, and later updated, if a bot posted it. |
 | `check-labels` | `true` | Run the label and milestone check. |
 | `check-release-note` | `true` | Run the release-note check. |
 | `docs-labels` | `docs-changelog-only,docs-needed,docs-not-needed` | Exactly one is required. Empty disables this check. |

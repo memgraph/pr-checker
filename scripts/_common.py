@@ -35,7 +35,8 @@ def load_pull_request(token: str | None) -> dict:
     """Return the PR this event is about, fetched live from the API.
 
     The event payload is a snapshot from when the event fired, so a re-run would
-    see stale labels and milestone. Falls back to the payload if the fetch fails.
+    see stale labels and milestone. Falls back to the payload if the fetch fails:
+    that is current on the first run, and only a re-run can see stale data.
     """
     event = load_event()
     payload_pr = event.get("pull_request") or {}

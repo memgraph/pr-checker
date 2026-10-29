@@ -55,8 +55,9 @@ def make_pr(labels=(), milestone="v1", author="alice", number=1):
     }
 
 
-def make_comment(body, login="alice", association="CONTRIBUTOR", comment_id=10):
-    return {"id": comment_id, "body": body, "user": {"login": login}, "author_association": association}
+def make_comment(body, login="alice", association="CONTRIBUTOR", comment_id=10, user_type="User"):
+    user = {"login": login, "type": user_type} if login else None
+    return {"id": comment_id, "body": body, "user": user, "author_association": association}
 
 
 class FakeResponse(io.BytesIO):
@@ -187,6 +188,15 @@ class LoadPullRequestTest(EventTestCase):
         self.load({"pull_request": make_pr()}, api, GITHUB_API_URL="https://ghe.example/api/v3")
         self.assertEqual(len(api.calls), 1)
 
+    def test_without_token_uses_payload(self):
+        api = FakeAPI({})
+        event = {"pull_request": make_pr(labels=["stale"])}
+        with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": self.write_event(event), "GITHUB_REPOSITORY": REPO},
+                             clear=True), mock.patch("urllib.request.urlopen", api):
+            pr = load_pull_request("")
+        self.assertEqual(pr["labels"], [{"name": "stale"}])
+        self.assertEqual(api.calls, [])
+
 
 class CheckLabelsTest(EventTestCase):
     def run_main(self, labels, milestone, **env):
@@ -245,7 +255,7 @@ class CheckChangelogTest(EventTestCase):
 
     def advisory(self, text="**Release note blocked**", comment_id=99):
         return make_comment(f"{check_changelog.ADVISORY_MARKER}\n{text}", login="github-actions[bot]",
-                            association="NONE", comment_id=comment_id)
+                            association="NONE", comment_id=comment_id, user_type="Bot")
 
     def test_passes_without_openai_key(self):
         self.assertEqual(self.run_main([make_comment(TEMPLATE.format(note=NOTE))]), 0)
@@ -351,6 +361,61 @@ class CheckChangelogTest(EventTestCase):
         })
         self.assertEqual(self.run_script(check_changelog, {"pull_request": pr}, api), 1)
         self.assertIn("::error::Could not fetch PR comments", self.output)
+
+    def test_missing_token_fails(self):
+        self.assertEqual(self.run_main([make_comment(TEMPLATE.format(note=NOTE))], GITHUB_TOKEN=""), 1)
+        self.assertIn("GITHUB_TOKEN is required", self.output)
+
+    def test_skip_label_survives_comment_fetch_failure(self):
+        pr = make_pr(labels=["docs-not-needed"])
+        api = FakeAPI({
+            ("GET", f"{API}/repos/{REPO}/pulls/1"): pr,
+            ("GET", pr["comments_url"]): http.client.RemoteDisconnected("gone"),
+        })
+        self.assertEqual(self.run_script(check_changelog, {"pull_request": pr}, api), 0)
+        self.assertIn("::warning::Could not fetch PR comments", self.output)
+
+    def test_skipped_quality_check_resolves_existing_advisory(self):
+        comments = [make_comment(TEMPLATE.format(note=NOTE)), self.advisory()]
+        self.assertEqual(self.run_main(comments), 0)
+        [(method, url, body)] = self.api.writes()
+        self.assertEqual(method, "PATCH")
+        self.assertTrue(url.endswith("/issues/comments/99"))
+        self.assertIn("resolved", body["body"])
+        self.assertIn("skipped", body["body"])
+
+    def test_advisory_marker_from_a_person_is_ignored(self):
+        spoof = make_comment(f"{check_changelog.ADVISORY_MARKER}\nhi", login="mallory", comment_id=5)
+        comments = [make_comment(TEMPLATE.format(note=NOTE)), spoof]
+        self.assertEqual(self.run_main(comments, openai=openai_reply("advise", "Typo.")), 0)
+        [(method, _, _)] = self.api.writes()
+        self.assertEqual(method, "POST")
+
+    def test_advisory_marker_after_whitespace_is_found(self):
+        comments = [make_comment(TEMPLATE.format(note=NOTE)), self.advisory()]
+        comments[1]["body"] = "\n" + comments[1]["body"]
+        self.assertEqual(self.run_main(comments, openai=openai_reply("advise", "Typo.")), 0)
+        [(method, _, _)] = self.api.writes()
+        self.assertEqual(method, "PATCH")
+
+    def test_advisory_is_not_a_note_source(self):
+        quoted = self.advisory(TEMPLATE.format(note=NOTE))
+        self.assertEqual(self.run_main([quoted]), 1)
+        self.assertIn("No release note found", self.output)
+
+    def test_note_from_deleted_user_is_reported_without_none(self):
+        self.assertEqual(self.run_main([make_comment(TEMPLATE.format(note=NOTE), login=None)]), 1)
+        self.assertIn("a deleted user", self.output)
+        self.assertNotIn("@None", self.output)
+
+    def test_model_reason_cannot_start_a_workflow_command(self):
+        reason = "Bad.\n::add-mask::secret\n::error::fake"
+        code = self.run_main([make_comment(TEMPLATE.format(note=NOTE))], openai=openai_reply("block", reason))
+        self.assertEqual(code, 1)
+        log_lines = self.output.splitlines()
+        self.assertFalse([line for line in log_lines if line.startswith("::add-mask::")])
+        self.assertIn("::error::Release note blocked by quality check: Bad. ::add-mask::secret ::error::fake",
+                      log_lines)
 
     def test_code_span_handles_backticks(self):
         self.assertEqual(check_changelog.code_span("a `b` c"), "``a `b` c``")
