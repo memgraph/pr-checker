@@ -43,6 +43,9 @@ Rules:
 - Immediately followed by a space and the markdown link "[#N](URL)"
   where N is the PR number and URL is the PR's html_url.
 - The PR number and URL MUST match the PR provided.
+- Exception: a breaking change may say what changes for existing users and
+  how to migrate, in a few sentences or "Before / Now / What to do" parts,
+  before the link. Don't flag that as too long or ask to shorten it.
 - Humour is fine as long as it's professional and friendly.
 - No profanity, slurs, or otherwise rude language.
 - Must be meaningful content, not gibberish or leftover placeholder text.
